@@ -19,8 +19,15 @@ answers — no project setup, no file uploads, no local course folder.
 | `get_case_study_answers` | Trainers Sheet answer key, per tool or full index |
 | `search_formula_bible` | Full-text search (cell refs, rules, scheme terms, figures) |
 | `tvm_calculate` | TVM engine with explicit convention A/B/C/D selection; returns the periodic rate used so the convention is auditable |
+| `search_course_content` | BM25 search across the full course corpus — Handouts, PPTs, all Levels. Filterable by session and kind. |
+| `get_session_material` | Every document held for one session, with previews |
+| `corpus_status` | Coverage report — documents, passages, sessions covered, last ingest |
 
 Plus one prepared prompt: `answer_qpfp_question`.
+
+The server runs with or without the course corpus. If `data/course_corpus.json` is
+absent, the three corpus tools say so plainly and the nine ProTool tools carry on
+unaffected.
 
 **Kernel validation.** `tvm_calculate` was checked against ten cached workbook
 figures across ProTools 05, 10, 18, 32, 33 and 34 — all match to the rupee
@@ -35,6 +42,53 @@ with it. That is why `qpfp_operating_protocol` exists: the server's `instruction
 field tells Claude to call it first, and the tool returns the full workflow and
 output format. The connector therefore configures itself in any user's account,
 on any plan, with zero onboarding.
+
+---
+
+## Loading the full course corpus
+
+The ProTool Formula Bible ships in the repo. The Handouts and PPTs do not — they
+live on the machine that holds the Network FP course folder. Compile them in:
+
+```bash
+pip install -r requirements-ingest.txt
+python3 ingest.py "/Users/praxysmac/Downloads/QPFP B15"
+git add data/course_corpus.json
+git commit -m "Course corpus"
+git push
+```
+
+`ingest.py` walks the folder, extracts text from `.pdf`, `.docx`, `.pptx`, `.xlsx`
+and `.md`, tags each document by Level / session / kind, chunks it, and writes
+`data/course_corpus.json`. It prints a coverage report and names any session with no
+material, plus any file it could not read. Legacy `.doc` and `.ppt` are skipped —
+convert to `.docx` / `.pptx` and re-run to include them.
+
+Re-run and push whenever the course material changes; Railway redeploys and learners
+pick it up on their next question.
+
+**Repo size:** GitHub warns above 50 MB per file and rejects above 100 MB. If the
+corpus is large, exclude the ProTool workbooks from ingestion — the Formula Bible
+already carries their logic at higher fidelity.
+
+---
+
+## Access control
+
+The server reads `MCP_PATH` at startup. Leave it unset and the endpoint is `/mcp`.
+Set it in Railway to something unguessable:
+
+```
+MCP_PATH=/b15-9f3a2c71/mcp
+```
+
+The connector URL becomes `https://qpfpgenius.up.railway.app/b15-9f3a2c71/mcp`, and
+the bare `/mcp` path returns 404. Rotating the variable revokes every existing copy
+of the URL at once — issue a fresh path per cohort and old links die on rotation.
+
+This is obscurity, not cryptography: anyone holding the URL has full access until it
+rotates. For a paying cohort that is usually the right trade. For genuinely public
+distribution, trim the corpus instead.
 
 ---
 

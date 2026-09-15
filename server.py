@@ -10,8 +10,11 @@ Deploy: Railway / Render / Fly / Cloudflare. Listens on $PORT, path /mcp.
 
 from __future__ import annotations
 
+import json
+import math
 import os
 import re
+from collections import Counter
 from pathlib import Path
 
 from fastmcp import FastMCP
@@ -24,14 +27,23 @@ mcp = FastMCP(
     name="QPFP Genius",
     instructions=(
         "QPFP Genius is the Network FP QPFP (Qualified Personal Finance Professional) "
-        "exam and practice engine. It carries the live cell formulas, conventions and "
-        "verified figures of all 36 official ProTool workbooks.\n\n"
+        "exam and practice engine. It carries two bodies of knowledge: (1) the live cell "
+        "formulas, conventions and verified figures of all 36 official ProTool workbooks, "
+        "and (2) the full course corpus — Handouts, PPTs and session material across "
+        "Levels I, II and III.\n\n"
         "ALWAYS call `qpfp_operating_protocol` first in a conversation — it returns the "
-        "answering protocol and the required 10-section output format. Then route the "
-        "question with `route_question`, load the tool with `get_protool`, compute with "
-        "`tvm_calculate`, and sanity-check against `get_convention_register`.\n\n"
-        "Never answer a QPFP calculation from generic financial theory. The ProTool's "
-        "convention decides the answer; textbook shortcuts manufacture the distractors."
+        "answering protocol and the required 10-section output format.\n\n"
+        "For CALCULATION questions: route with `route_question`, load the tool with "
+        "`get_protool`, compute with `tvm_calculate`, sanity-check with "
+        "`get_convention_register`.\n\n"
+        "For THEORY, CONCEPT, DEFINITION, REGULATION or any other personal-finance "
+        "question: use `search_course_content` to retrieve the Handout and PPT passages, "
+        "and cite the session and file you answered from. Use `get_session_material` when "
+        "the learner names a session.\n\n"
+        "Never answer from generic financial theory when the corpus covers it. The "
+        "ProTool's convention decides a calculated answer; textbook shortcuts manufacture "
+        "the distractors. If neither the Bible nor the corpus covers a point, say so and "
+        "flag the answer as not course-verified."
     ),
 )
 
@@ -67,6 +79,78 @@ PARTS = _index_parts()
 LEVEL = {**{n: "Level I" for n in range(1, 13)},
          **{n: "Level II" for n in range(13, 25)},
          **{n: "Level III" for n in range(25, 37)}}
+
+# ------------------------------------------------------- course corpus + BM25
+
+CORPUS_PATH = DATA / "course_corpus.json"
+CORPUS: dict = {}
+PASSAGES: list[dict] = []          # {doc, session, level, kind, file, text, tokens}
+_DF: Counter = Counter()
+_AVGLEN: float = 1.0
+
+_TOKEN_RE = re.compile(r"[a-z0-9]+")
+_STOP = {
+    "the", "a", "an", "of", "to", "in", "is", "and", "for", "on", "at", "as", "by",
+    "it", "be", "are", "was", "with", "that", "this", "from", "or", "if", "will",
+    "can", "has", "have", "not", "but", "which", "you", "your", "i", "we", "he",
+    "she", "they", "his", "her", "their", "there", "what", "when", "how", "all",
+    "any", "may", "than", "then", "so", "such", "into", "also", "its", "per",
+}
+
+
+def _tok(s: str) -> list[str]:
+    return [t for t in _TOKEN_RE.findall(s.lower()) if t not in _STOP and len(t) > 1]
+
+
+def _load_corpus() -> None:
+    global CORPUS, PASSAGES, _DF, _AVGLEN
+    if not CORPUS_PATH.exists():
+        return
+    try:
+        CORPUS = json.loads(CORPUS_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        CORPUS = {}
+        return
+    for doc in CORPUS.get("docs", []):
+        for ch in doc.get("chunks", []):
+            PASSAGES.append({
+                "title": doc.get("title", ""),
+                "file": doc.get("file", ""),
+                "session": doc.get("session"),
+                "level": doc.get("level"),
+                "kind": doc.get("kind", "other"),
+                "text": ch,
+                "tokens": _tok(ch),
+            })
+    for p in PASSAGES:
+        _DF.update(set(p["tokens"]))
+    if PASSAGES:
+        _AVGLEN = sum(len(p["tokens"]) for p in PASSAGES) / len(PASSAGES)
+
+
+def _bm25(query: str, pool: list[dict], top: int, k1: float = 1.5, b: float = 0.75):
+    q = _tok(query)
+    if not q or not pool:
+        return []
+    N = max(len(PASSAGES), 1)
+    scored = []
+    for p in pool:
+        tf = Counter(p["tokens"])
+        dl = len(p["tokens"]) or 1
+        s = 0.0
+        for term in q:
+            f = tf.get(term, 0)
+            if not f:
+                continue
+            idf = math.log(1 + (N - _DF[term] + 0.5) / (_DF[term] + 0.5))
+            s += idf * (f * (k1 + 1)) / (f + k1 * (1 - b + b * dl / _AVGLEN))
+        if s > 0:
+            scored.append((s, p))
+    scored.sort(key=lambda x: -x[0])
+    return scored[:top]
+
+
+_load_corpus()
 
 # Keyword → ProTool number. First match on a longer phrase wins.
 ROUTES: list[tuple[str, int]] = [
@@ -352,6 +436,119 @@ def tvm_calculate(
     )
 
 
+@mcp.tool
+def search_course_content(
+    query: str,
+    session: int | None = None,
+    kind: str | None = None,
+    max_results: int = 5,
+) -> str:
+    """Search the full QPFP course corpus — Handouts, PPTs and session material across
+    all three Levels. Use this for ANY theory, concept, definition, regulation, product
+    or process question, and for anything the Formula Bible does not cover.
+
+    query: natural-language question or key terms
+    session: optional 1–36 filter
+    kind: optional 'handout' | 'ppt' | 'protool' | 'assessment'
+    Returns ranked passages with their session, file and Level, for citation.
+    """
+    if not PASSAGES:
+        return (
+            "Course corpus not loaded. Only the ProTool Formula Bible is available "
+            "on this server — use `get_protool`, `search_formula_bible` and "
+            "`list_protools`. (To add the corpus, run ingest.py over the course "
+            "folder and redeploy.)"
+        )
+    pool = PASSAGES
+    if session is not None:
+        pool = [p for p in pool if p["session"] == session]
+    if kind:
+        pool = [p for p in pool if p["kind"] == kind.lower()]
+    if not pool:
+        return f"No material matches session={session}, kind={kind}."
+
+    hits = _bm25(query, pool, max(1, min(max_results, 10)))
+    if not hits:
+        return (
+            f"No course passage matches '{query}'. Try broader terms, or "
+            f"`search_formula_bible` if this is a ProTool calculation point."
+        )
+    out = [f"# Course corpus — {len(hits)} passage(s) for: {query}", ""]
+    for score, p in hits:
+        sess = f"Session {p['session']:02d}" if p["session"] else "unmapped"
+        out.append(
+            f"---\n**{p['title']}** · {p['level'] or '?'} · {sess} · "
+            f"{p['kind']} · _relevance {score:.1f}_\n"
+            f"`{p['file']}`\n\n{p['text']}\n"
+        )
+    out.append(
+        "---\nCite the session and file above in section 8 of your answer. "
+        "If the passage does not settle the question, say so rather than extrapolating."
+    )
+    return "\n".join(out)
+
+
+@mcp.tool
+def get_session_material(session_number: int, kind: str | None = None) -> str:
+    """List every course document held for one session (1–36) — Handouts, PPTs,
+    workbooks — with a preview of each. Use when the learner names a session, then
+    follow up with `search_course_content(session=N, query=...)` for the detail."""
+    if not PASSAGES:
+        return "Course corpus not loaded on this server. See `corpus_status`."
+    docs = [d for d in CORPUS.get("docs", []) if d.get("session") == session_number]
+    if kind:
+        docs = [d for d in docs if d.get("kind") == kind.lower()]
+    if not docs:
+        return (
+            f"No course material for session {session_number}"
+            f"{f' of kind {kind}' if kind else ''}. "
+            f"The ProTool logic is still available via `get_protool({session_number})`."
+        )
+    out = [f"# Session {session_number:02d} — {LEVEL.get(session_number,'')}", ""]
+    for d in docs:
+        preview = d["chunks"][0][:400].replace("\n", " ") if d.get("chunks") else ""
+        out.append(
+            f"**{d['title']}** · {d['kind']} · {len(d.get('chunks', []))} passages\n"
+            f"`{d['file']}`\n\n> {preview}…\n"
+        )
+    return "\n".join(out)
+
+
+@mcp.tool
+def corpus_status() -> str:
+    """Report what course material this server is carrying — document count, passage
+    count, sessions covered, and when it was last ingested. Use to check coverage
+    before telling a learner something is not in the course."""
+    lines = [
+        "# QPFP Genius coverage", "",
+        f"- ProTool Formula Bible: **{len(SECTIONS)}/36** tools, "
+        f"Parts {', '.join(str(p) for p in sorted(PARTS))}",
+    ]
+    if not PASSAGES:
+        lines += [
+            "- Course corpus: **not loaded**",
+            "",
+            "Only ProTool logic is available. Theory questions should be answered from "
+            "the framework entries (ProTools 03, 08, 09, 11, 12, 13, 14, 22, 25, 26, "
+            "29, 31, 35) and flagged where the course text would be needed.",
+        ]
+        return "\n".join(lines)
+    sessions = sorted({d["session"] for d in CORPUS.get("docs", []) if d.get("session")})
+    missing = [n for n in range(1, 37) if n not in sessions]
+    kinds = Counter(d.get("kind") for d in CORPUS.get("docs", []))
+    lines += [
+        f"- Course corpus: **{CORPUS.get('doc_count', 0)} documents**, "
+        f"**{CORPUS.get('chunk_count', 0):,} passages**",
+        f"- Sessions covered: **{len(sessions)}/36**",
+        f"- By kind: " + " · ".join(f"{k} {v}" for k, v in kinds.most_common()),
+        f"- Ingested: {CORPUS.get('generated', 'unknown')}",
+    ]
+    if missing:
+        lines.append(f"- **No course text for sessions: {missing}** — answer those from "
+                     f"the Formula Bible and flag the gap.")
+    return "\n".join(lines)
+
+
 @mcp.prompt
 def answer_qpfp_question(question: str) -> str:
     """Prepared prompt: answer a QPFP exam question in the full 10-section format."""
@@ -366,5 +563,7 @@ if __name__ == "__main__":
         transport="http",
         host="0.0.0.0",
         port=int(os.environ.get("PORT", 8000)),
-        path="/mcp",
+        # Set MCP_PATH in Railway to something unguessable (e.g. /b15-9f3a2c71/mcp)
+        # to turn the URL itself into a revocable access key. Change it to revoke.
+        path=os.environ.get("MCP_PATH", "/mcp"),
     )
